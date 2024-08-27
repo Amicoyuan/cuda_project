@@ -18,6 +18,12 @@ using namespace nvcuda;
 // tensor core 相关的op都在  nvcuda:wmma  命名空间下
 // 详情见：https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#wmma-description 
 
+/*
+A100 SM80 FP16的最高算力是 312 TFLOPS
+一共有108个SM 
+根据计算能力为 8.0 的 A100 GPU, 每个 SM 最多可以支持 64 个并发 warps, 而对于计算能力为 8.6 的 GPU，每个 SM 可以支持最多 48 个并发 warps
+一个SM有4个Tensor core
+*/
 
 __global__ void sgemm_warp_tensor_op(int M, int N, int K, void *__restrict__ d_A, void *__restrict__ d_B, void *__restrict__ d_C) {
     
@@ -28,6 +34,9 @@ __global__ void sgemm_warp_tensor_op(int M, int N, int K, void *__restrict__ d_A
     
     const int K_tiles = (K + WMMA_K - 1) / WMMA_K;
 
+
+    // 这里比较简单  因为一个block 里面只有一个warp
+    // 每个warp负责计算 WARP_M, WARP_N 这个C矩阵tile
     const int warp_row = blockIdx.y * WMMA_M;
     const int warp_col = blockIdx.x * WMMA_N;
 
@@ -45,6 +54,10 @@ __global__ void sgemm_warp_tensor_op(int M, int N, int K, void *__restrict__ d_A
     for (size_t i = 0; i < K_tiles; i++) {
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+        // ldm描述连续行（对于行主要布局）或列（对于列主要布局）之间的元素跨度
+        // 在这里即为K
+        
+        // 这里偏移很好理解了 
         wmma::load_matrix_sync(A_frag, A + warp_row * K + i * WMMA_K, K);
         wmma::load_matrix_sync(B_frag, B + i * WMMA_K + warp_col * K, K);
 
