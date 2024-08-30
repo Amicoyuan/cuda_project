@@ -51,17 +51,26 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int tid = threadIdx.x;
-    int wid = tid >> 5;
 
-    const int APAD = 8;
+    // 右移 5位 相当于 tid / 32
+    int wid = tid >> 5;  // warp_tid  当前有8个warp
+
+    // 每个 warp 算的 C_tile 为 [M_64, N_64]
+
+    const int APAD = 8;  // pad 避免 bank conflict
     const int BPAD = 8;
+    
 
+    // NV 共有 32个 bank , 一个 bank 4B。 总共 128 B
+    // float4 是 4 * 4 = 16B，
+    // 但是 FLOAT4 是8个half,  
+    // 这里就需要 pad 4 * 4B = 16B, 刚好对应者 2 * 8个half = 16B 
     __shared__ half s_a[BM][BK + APAD];
     __shared__ half s_b[BK][BN + BPAD];
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a[2][4];
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b[2][4];
-    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_c[4][4];
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_a[2][4];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_b[2][4];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> frag_c[4][4];
 
     #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -70,11 +79,75 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
             wmma::fill_fragment(frag_c[i][j], 0.0);
         }
     }
+    /*
+    tid = 0-3   load_a_smem_m 0
+    tid = 4-7   load_a_smem_m 2
+    tid = 124-127 load load_a_smem_m 62
+    tid = 252-255 load load_a_smem_m 126
+    */
+    int load_a_smem_m = (tid >> 2) << 1;    // 除 4 * 2
+    /*
+    // 每个线程对应拿8个half
+    tid     load_a_smem_k
+    0       0
+    1       8
+    2      16
+    3      24
+    */
+    int load_a_smem_k = (tid &  3) << 3;    // 与操作 再 * 8 = tid 的最后两位乘以 8
 
-    int load_a_smem_m = (tid >> 2) << 1;
-    int load_a_smem_k = (tid &  3) << 3;
-    int load_b_smem_k = (tid >> 5) << 2;
-    int load_b_smem_n = (tid & 31) << 3;
+    /*
+    tid     load_b_smem_k
+    0       0
+    1       0
+    ...
+    31      0
+    32      4
+    ...
+    63      4
+    64      8
+    ...
+    95      8
+    96      12
+    ...
+    127     12
+    128     16
+    ...
+    159     16
+    160     20
+    ...
+    191     20
+    192     24
+    ...
+    223     24
+    224     28
+    ...
+    255     28
+    */
+    int load_b_smem_k = (tid >> 5) << 2; // 除以32 * 4
+    /*
+    tid     load_b_smem_n
+    0       0
+    1       8
+    2      16
+    3      24
+    ...
+    27     216
+    28     224
+    29     232
+    30     240
+    31     248
+    32      0
+    33     16
+    ...
+    61     248
+    62      0
+    63     248
+    64      0
+    ...
+    255   248
+    */
+    int load_b_smem_n = (tid & 31) << 3; // 这个表达式相当于将 tid 的最低5位乘以 8
 
     int load_a_gmem_m = by * BM + load_a_smem_m;
     int load_b_gmem_n = bx * BN + load_b_smem_n;
@@ -86,18 +159,26 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
     int comp_c_frag_n = wid >> 1;
 
     for (int bk = 0; bk < K / BK; bk++) {
+        // 每 4 个线程拿 A [M_2, K_32]
         FLOAT4(s_a[load_a_smem_m    ][load_a_smem_k]) = FLOAT4(a[load_a_gmem_addr        ]);
         FLOAT4(s_a[load_a_smem_m + 1][load_a_smem_k]) = FLOAT4(a[load_a_gmem_addr +     K]);
+
+        // 每 32 个线程  拿 B [ K_4, N_256 ]
         FLOAT4(s_b[load_b_smem_k    ][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr        ]);
         FLOAT4(s_b[load_b_smem_k + 1][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr +     N]);
         FLOAT4(s_b[load_b_smem_k + 2][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr + 2 * N]);
         FLOAT4(s_b[load_b_smem_k + 3][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr + 3 * N]);
+        
 
+
+        // 偏移指正 下轮 K迭代
         load_a_gmem_addr += BK;
         load_b_gmem_addr += BK * N;
 
         __syncthreads();
+        
 
+        // warp tensor op 读 smem
         wmma::load_matrix_sync(frag_a[0][0], &s_a[comp_c_frag_m * 64     ][ 0], BK + APAD);
         wmma::load_matrix_sync(frag_a[0][1], &s_a[comp_c_frag_m * 64 + 16][ 0], BK + APAD);
         wmma::load_matrix_sync(frag_a[0][2], &s_a[comp_c_frag_m * 64 + 32][ 0], BK + APAD);
@@ -116,6 +197,9 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
         wmma::load_matrix_sync(frag_b[1][2], &s_b[16][comp_c_frag_n * 64 + 32], BN + BPAD);
         wmma::load_matrix_sync(frag_b[1][3], &s_b[16][comp_c_frag_n * 64 + 48], BN + BPAD);
 
+
+
+        // A行B列  增加数据复用
         #pragma unroll
         for (int i = 0; i < 4; i++) {
             #pragma unroll
@@ -128,6 +212,8 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
         __syncthreads();
     }
 
+
+    // 写回C
     int store_c_gmem_m = by * BM + comp_c_frag_m * 64;
     int store_c_gmem_n = bx * BN + comp_c_frag_n * 64;
     int store_c_gmem_addr = OFFSET(store_c_gmem_m, store_c_gmem_n, N);
@@ -142,9 +228,9 @@ __global__ void sgemm_warp_tensor_op(const int M, const int N, const int K,
 
 
 int main() {
-    int M = 2048; // Example value
-    int N = 4096; // Example value
-    int K = 4096; // Example value
+    int M = 4096; // Example value
+    int N = 8192; // Example value
+    int K = 8192; // Example value
 
     // Allocate host memory
     float *h_A_ft32 = new float[M * K];
